@@ -8,6 +8,7 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
 from record_agent.db_config import session_scope
 from record_agent.models import User, ChatHistory, ChatSession
 
@@ -15,16 +16,18 @@ default_memory_config = {
     "maxlen": 30
 }
 default_model = "qwen3-max"
-default_system_prompt = "你是ztkk,一个智能手账助手，语气尽量温和有力"
+default_system_prompt = "你是ztkk,一个智能手账助手，语气尽量温和有力。只需要回答最新的问题,不用每次都介绍自己，需要的时候才介绍"
 
 role_dict = {
     0: "user",
     1: "assistant",
     2: "system"
 }
+default_chroma_db_filePath = "../chroma_db"
+default_topK = 4
 
 
-def save_rag(filePath: str, collectionName: str, userId: int = None) -> str:
+def save_rag(filePath: str, collectionName: str) ->bool:
     """
     保存文档到向量数据库（支持文件和目录）
 
@@ -86,11 +89,12 @@ def save_rag(filePath: str, collectionName: str, userId: int = None) -> str:
             vs = Chroma(
                 collection_name=collectionName,
                 embedding_function=embedding_function,
-                persist_directory="./chroma_db"
+                persist_directory=default_chroma_db_filePath
             )
             vs.add_documents(texts)
 
-            return f"文件已保存，共分割成 {len(texts)} 个文档块"
+            print( f"文件已保存，共分割成 {len(texts)} 个文档块")
+            return True
 
         elif os.path.isdir(filePath):
             all_documents = []
@@ -121,33 +125,44 @@ def save_rag(filePath: str, collectionName: str, userId: int = None) -> str:
                             continue
 
             if file_count == 0:
-                return "目录为空或没有支持的文件"
+                print( "目录为空或没有支持的文件")
+                return True
 
             texts = text_splitter.split_documents(all_documents)
 
             if len(texts) == 0:
-                return "没有文档内容可保存"
+                print( "没有文档内容可保存")
+                return True
 
-            api_key = os.environ.get('DASHSCOPE_API_KEY')
-            if api_key:
-                embedding_function = DashScopeEmbeddings(dashscope_api_key=api_key)
-            else:
-                embedding_function = DashScopeEmbeddings()
+            embedding_function = DashScopeEmbeddings()
 
             vs = Chroma(
                 collection_name=collectionName,
                 embedding_function=embedding_function,
-                persist_directory="./chroma_db"
+                persist_directory=default_chroma_db_filePath
             )
             vs.add_documents(texts)
-
-            return f"目录已保存，共处理 {file_count} 个文件，分割成 {len(texts)} 个文档块"
-
+            print(f"目录已保存，共处理 {file_count} 个文件，分割成 {len(texts)} 个文档块")
+            return True
         else:
             return "路径不存在或不是有效的文件/目录"
 
     except Exception as e:
-        return f"处理失败: {str(e)}"
+        print( f"处理失败: {str(e)}")
+        return False
+
+def get_rag(input:str,collectionName: str):
+    embedding_function = DashScopeEmbeddings()
+    vs = Chroma(
+        collection_name=collectionName,
+        embedding_function=embedding_function,
+        persist_directory=default_chroma_db_filePath
+    )
+    res = []
+    docs = vs.similarity_search(input,default_topK)
+    for doc in docs:
+        res.append(doc.page_content)
+    return res
 
 
 def get_history(userId: int, sessionId: int):
@@ -155,7 +170,7 @@ def get_history(userId: int, sessionId: int):
         chatHistorys = session.query(ChatHistory).filter(
             ChatHistory.user_id == userId,
             ChatHistory.session_id == sessionId
-        ).all()
+        ).order_by(ChatHistory.create_time).all()
         if None == chatHistorys or len(chatHistorys) == 0:
             return []
         res = []
@@ -195,20 +210,6 @@ def save_history(userId: int, sessionId: int, chatHistorys: List[ChatHistory]):
 
 def chat(model_name: str, input, sessionId: int = None, userId: int = None, system_prompt: str = None):
     if sessionId is None:
-        if userId is None:
-            with session_scope() as session:
-                user = session.query(User).filter(User.account == 'guest').first()
-                if user is None:
-                    user = User(
-                        account='guest',
-                        password='guest',
-                        create_time=datetime.now(),
-                        update_time=datetime.now()
-                    )
-                    session.add(user)
-                    session.flush()
-                userId = user.id
-
         with session_scope() as session:
             newSession = ChatSession(
                 user_id=userId,
@@ -231,10 +232,12 @@ def chat(model_name: str, input, sessionId: int = None, userId: int = None, syst
         if system_prompt is None:
             system_prompt = default_system_prompt
 
-        prompt = PromptTemplate.from_template(f"{{system_prompt}}\n请根据历史记录{{chat_history}}，回答用户提问{{input}}")
+        prompt = PromptTemplate.from_template("{system_prompt}\n请根据历史记录{chat_history}和搜寻到的资料{docs}作为用户喜好的参考不用回答历史问题，回答用户提问{{input}}")
+        print(prompt)
         chat_history = get_history(userId, sessionId)
         chat = prompt | model
-        answer = chat.invoke({"input": input, "chat_history": chat_history})
+        docs = get_rag(input,"pet")
+        answer = chat.invoke({"system_prompt":system_prompt,"input": input, "chat_history": chat_history,"docs": docs})
         saveHistorys = []
 
         if type(input) == str:
@@ -262,4 +265,7 @@ def chat(model_name: str, input, sessionId: int = None, userId: int = None, syst
 
 
 if __name__ == "__main__":
-    pass
+    # save_rag("../test","pet")
+    print( chat(None,"我又买了一条小狗",1,1))
+    print(2)
+    print(chat(None, "给这条边牧取个名字吧", 1, 1))
