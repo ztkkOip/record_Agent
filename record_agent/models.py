@@ -128,7 +128,7 @@ class ChatHistory(Base):
     user_id = Column(Integer, comment='用户ID')
     role = Column(Integer, default=0, comment='角色类型：0-user, 1-assistant, 2-system')
     content = Column(Text, comment='对话内容')
-    message_type = Column(String(20), default='text', comment='消息类型：text/image/audio/file')
+    message_type = Column(String(20), default='text', comment='消息类型：text/image/audio/file/summary')
     tokens_used = Column(Integer, default=0, comment='使用的token数量')
     model = Column(String(50), comment='使用的大模型名称')
     meta_data = Column('metadata', Text, default='{}', comment='扩展元数据（JSON格式）')
