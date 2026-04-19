@@ -4,13 +4,13 @@ from typing import List
 import os
 from pathlib import Path
 
-from langchain_community.chat_models import ChatTongyi
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-
+from dashscope import Generation
 from record_agent.db_config import session_scope
 from record_agent.models import User, ChatHistory, ChatSession
+from record_agent.utils.RAGUtil import get_rag
 
 default_memory_config = {
     "maxlen": 20
@@ -24,8 +24,8 @@ role_dict = {
     1: "assistant",
     2: "system"
 }
-default_chroma_db_filePath = "../chroma_db"
-default_topK = 4
+
+
 
 # Redis 配置
 redis_url = os.environ.get('REDIS_URL', "redis://localhost:6380/0")
@@ -116,135 +116,7 @@ def _save_to_redis(session_id: int, userId: int, user_message: str, assistant_me
 
 
 
-def save_rag(filePath: str, collectionName: str) -> bool:
-    try:
-        from langchain_community.document_loaders import TextLoader
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-        from langchain_chroma import Chroma
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
-        )
-
-        if os.path.isfile(filePath):
-            file_ext = Path(filePath).suffix.lower()
-
-            if file_ext in ['.pdf']:
-                try:
-                    from langchain_community.document_loaders import PyPDFLoader
-                    loader = PyPDFLoader(filePath)
-                    documents = loader.load()
-                except ImportError:
-                    from PyPDF2 import PdfReader
-                    reader = PdfReader(filePath)
-                    documents = [type('Document', page_content=page.extract_text(), metadata={'source': filePath}) for page in reader.pages]
-
-            elif file_ext in ['.docx']:
-                try:
-                    from langchain_community.document_loaders import Docx2txtLoader
-                    loader = Docx2txtLoader(filePath)
-                    documents = loader.load()
-                except ImportError:
-                    from docx import Document
-                    doc = Document(filePath)
-                    documents = [type('Document', page_content='\n'.join([para.text for para in doc.paragraphs]), metadata={'source': filePath})]
-
-            else:
-                loader = TextLoader(filePath, encoding='utf-8')
-                documents = loader.load()
-
-            texts = text_splitter.split_documents(documents)
-
-            if len(texts) == 0:
-                return "没有文档内容可保存"
-
-            api_key = os.environ.get('DASHSCOPE_API_KEY')
-            if api_key:
-                embedding_function = DashScopeEmbeddings(dashscope_api_key=api_key)
-            else:
-                embedding_function = DashScopeEmbeddings()
-
-            vs = Chroma(
-                collection_name=collectionName,
-                embedding_function=embedding_function,
-                persist_directory=default_chroma_db_filePath
-            )
-            vs.add_documents(texts)
-
-            print(f"文件已保存，共分割成 {len(texts)} 个文档块")
-            return True
-
-        elif os.path.isdir(filePath):
-            all_documents = []
-            file_count = 0
-
-            for root, dirs, files in os.walk(filePath):
-                for file in files:
-                    file_ext = Path(file).suffix.lower()
-
-                    if file_ext in ['.pdf', '.docx', '.txt', '.md', '.json', '.xml']:
-                        try:
-                            if file_ext == '.pdf':
-                                from langchain_community.document_loaders import PyPDFLoader
-                                loader = PyPDFLoader(os.path.join(root, file))
-                                docs = loader.load()
-                            elif file_ext == '.docx':
-                                from langchain_community.document_loaders import Docx2txtLoader
-                                loader = Docx2txtLoader(os.path.join(root, file))
-                                docs = loader.load()
-                            else:
-                                from langchain_community.document_loaders import TextLoader
-                                loader = TextLoader(os.path.join(root, file), encoding='utf-8')
-                                docs = loader.load()
-
-                            all_documents.extend(docs)
-                            file_count += 1
-                        except Exception:
-                            continue
-
-            if file_count == 0:
-                print("目录为空或没有支持的文件")
-                return True
-
-            texts = text_splitter.split_documents(all_documents)
-
-            if len(texts) == 0:
-                print("没有文档内容可保存")
-                return True
-
-            embedding_function = DashScopeEmbeddings()
-
-            vs = Chroma(
-                collection_name=collectionName,
-                embedding_function=embedding_function,
-                persist_directory=default_chroma_db_filePath
-            )
-            vs.add_documents(texts)
-            print(f"目录已保存，共处理 {file_count} 个文件，分割成 {len(texts)} 个文档块")
-            return True
-
-        else:
-            return "路径不存在或不是有效的文件/目录"
-
-    except Exception as e:
-        print(f"处理失败: {str(e)}")
-        return False
-
-
-def get_rag(input: str, collectionName: str)->List[str]:
-    from langchain_chroma import Chroma
-    embedding_function = DashScopeEmbeddings()
-    vs = Chroma(
-        collection_name=collectionName,
-        embedding_function=embedding_function,
-        persist_directory=default_chroma_db_filePath
-    )
-    res = []
-    docs = vs.similarity_search(input, default_topK)
-    for doc in docs:
-        res.append(doc.page_content)
-    return res
 
 
 def get_history(userId: int, sessionId: int)->dict:
@@ -321,7 +193,7 @@ def save_history(userId: int, sessionId: int, chatHistorys: List[ChatHistory]):
         return sessionId
 
 
-def chat(model_name: str, input: str, sessionId: int = None, userId: int = None, system_prompt: str = None):
+def chat(model_name: str, input: str, sessionId: int = None, userId: int = None, system_prompt: str = None) -> dict:
     if sessionId is None:
         with session_scope() as session:
             newSession = ChatSession(
@@ -336,12 +208,6 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 
     if model_name is None:
         model_name = default_model
-
-    try:
-        model = ChatTongyi(model=model_name)
-    except Exception:
-        yield {"sessionId": sessionId, "answer": "模型初始化失败", "done": True}
-        return
 
     if system_prompt is None:
         system_prompt = default_system_prompt
@@ -368,9 +234,10 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
     ])
 
     docs = get_rag(input, "pet")
-    prompt = PromptTemplate.from_template("请根据历史记录{chat_history},历史摘要{chat_summary}和搜寻到的资料{docs}回答用户提问")
-    print(prompt)
-    chat = prompt | model
+
+    # 构建 prompt
+    prompt_text = f"请根据历史记录{chat_history},历史摘要{chat_summary}和搜寻到的资料{docs}回答用户提问"
+    print(prompt_text)
 
     # 保存用户问题到数据库
     saveHistorys = []
@@ -384,29 +251,67 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
             create_time=datetime.now(),
         ))
 
-    full_answer = ""
+    # 使用官方 dashscope SDK 调用
+    try:
+        # 构建消息列表
+        messages = [{"role": "system", "content": system_prompt}]
 
-    # 流式输出
-    for chunk in chat.stream({"chat_history": chat_history, "docs": docs,"chat_summary": chat_summary}):
-        content = chunk.content if hasattr(chunk, 'content') else str(chunk)
-        full_answer += content
+        # 添加历史对话
+        for role, content in chat_history:
+            if role in ["user", "assistant"]:
+                messages.append({"role": role, "content": str(content)})
 
-        # 实时返回 chunk
-        yield {
+        # 添加用户问题
+        messages.append({"role": "user", "content": input})
+
+        response = Generation.call(
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            model=model_name,
+            messages=messages,
+            result_format="message",
+            enable_thinking=True,
+        )
+
+        if response.status_code == 200:
+            full_answer = response.output.choices[0].message.content
+
+            # 获取 token 使用量
+            total_input_tokens = response.usage.input_tokens
+            total_output_tokens = response.usage.output_tokens
+        else:
+            print(f"API错误: {response.status_code}, {response.code}, {response.message}")
+            return {
+                "sessionId": sessionId,
+                "answer": f"API错误: {response.message}",
+                "done": True,
+                "error": response.message
+            }
+
+    except Exception as e:
+        print(f"获取响应失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
             "sessionId": sessionId,
-            "answer": content,
-            "done": False
+            "answer": f"生成失败: {str(e)}",
+            "done": True,
+            "error": str(e)
         }
 
-    # 流式结束后，保存完整的助手回答
+    # 保存完整的助手回答
     saveHistorys.append(ChatHistory(
         user_id=userId,
         session_id=sessionId,
         content=full_answer,
         role=1,
         model=model_name,
+        tokens_used=total_output_tokens,
         create_time=datetime.now(),
     ))
+
+    # 更新用户问题的 token 使用量
+    if saveHistorys and len(saveHistorys) > 1:
+        saveHistorys[0].tokens_used = total_input_tokens
     sessionId = save_history(userId, sessionId, saveHistorys)
 
     # 保存到 Redis（如果超过 maxlen 会自动清理）
@@ -425,29 +330,42 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 
     if sumFlag:
         print("[调试] 开始执行摘要处理")
-        sum_model = ChatTongyi(model=sum_model_name)
-        sum_prompt = PromptTemplate.from_template("根据历史记录{chat_history}和已有的摘要提炼一份摘要{summary}，语言简洁，只保留和用户有关的关键信息，不要自己加信息")
-        chain_sum = sum_prompt | sum_model
-        sum_res = chain_sum.invoke({"chat_history": chat_history, "summary": history_dict["summary"]})
-        with session_scope() as session:
-            sum_chat_history = ChatHistory(
-                create_time=datetime.now(),
-                message_type="summary",
-                meta_data=json.dumps(sum_dict, ensure_ascii=False),
-                content=sum_res.content,
-                user_id=userId,
-                session_id=sessionId,
-                role=1
+        try:
+            # 构建摘要消息
+            summary_messages = [{"role": "system", "content": "根据历史记录和已有的摘要提炼一份摘要，语言简洁，只保留和用户有关的关键信息，不要自己加信息"}]
+            summary_messages.extend([{"role": m["role"], "content": m["content"]} for m in messages if m["role"] in ["user", "assistant"]])
+
+            sum_response = Generation.call(
+                api_key=os.getenv("DASHSCOPE_API_KEY"),
+                model=sum_model_name,
+                messages=summary_messages,
+                result_format="message",
             )
-            session.add(sum_chat_history)
-            print(sum_chat_history)
+
+            if sum_response.status_code == 200:
+                summary_content = sum_response.output.choices[0].message.content
+                with session_scope() as session:
+                    sum_chat_history = ChatHistory(
+                        create_time=datetime.now(),
+                        message_type="summary",
+                        meta_data=json.dumps(sum_dict, ensure_ascii=False),
+                        content=summary_content,
+                        user_id=userId,
+                        session_id=sessionId,
+                        role=1
+                    )
+                    session.add(sum_chat_history)
+                    print(sum_chat_history)
+        except Exception as e:
+            print(f"摘要处理失败: {e}")
     else:
         print("[调试] 跳过摘要处理，sumFlag 不满足条件")
 
-    # 标记流式结束
-    yield {
+    return {
         "sessionId": sessionId,
-        "answer": "",
+        "answer": full_answer,
+        "inputTokens": total_input_tokens,
+        "outputTokens": total_output_tokens,
         "done": True
     }
 
@@ -456,20 +374,16 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 if __name__ == "__main__":
     # save_rag("../test","pet")
 
-    # 第一次对话 - 流式输出
+    # 第一次对话
     print("=== 第一次对话 ===")
     print("问题：你是谁？")
-    print("回答：", end="", flush=True)
-    for chunk in chat(None, "你是谁？", 1, 1):
-        if not chunk["done"]:
-            print(chunk["answer"], end="", flush=True)
-    print("\n")
+    result = chat(None, "你是谁？", 1, 1)
+    print(f"回答：{result['answer']}")
+    print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
 
-    # 第二次对话 - 流式输出
+    # 第二次对话
     print("=== 第二次对话 ===")
     print("问题：我的边牧叫wish")
-    print("回答：", end="", flush=True)
-    for chunk in chat(None, "我的边牧叫wish", 1, 1):
-        if not chunk["done"]:
-            print(chunk["answer"], end="", flush=True)
-    print("\n")
+    result = chat(None, "我的边牧叫wish", 1, 1)
+    print(f"回答：{result['answer']}")
+    print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")

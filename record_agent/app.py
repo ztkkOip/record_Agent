@@ -1,5 +1,4 @@
-from flask import Flask, request, Response, jsonify
-import json
+from flask import Flask, request, jsonify
 from record_agent.utils.chatUtils import chat
 
 app = Flask(__name__)
@@ -14,10 +13,10 @@ def chat_endpoint():
     - userId: 用户ID (必填)
     - sessionId: 会话ID (可选，不传则创建新会话)
     - input: 用户输入内容 (必填)
-    - model_name: 模型名称 (可选，默认使用 qwen3-max)
+    - model_name: 模型名称 (可选，默认使用 qwen3.5-27b)
     - system_prompt: 系统提示词 (可选)
 
-    返回: Server-Sent Events (SSE) 流式输出
+    返回: JSON 格式
     """
     data = request.get_json()
 
@@ -26,6 +25,7 @@ def chat_endpoint():
     sessionId = data.get('sessionId')
     user_input = data.get('input')
     model_name = data.get('model_name')
+    system_prompt = data.get('system_prompt')
 
     if not userId or not user_input:
         return jsonify({
@@ -33,25 +33,22 @@ def chat_endpoint():
             'required': ['userId', 'input']
         }), 400
 
-    def generate():
-        try:
-            for chunk in chat(
-                model_name=model_name,
-                input=user_input,
-                sessionId=sessionId,
-                userId=userId,
-            ):
-                # SSE 格式: data: {json}\n\n
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        except Exception as e:
-            error_chunk = {
-                'sessionId': sessionId,
-                'answer': f'服务错误: {str(e)}',
-                'done': True
-            }
-            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
-
-    return Response(generate(), mimetype='text/event-stream')
+    try:
+        result = chat(
+            model_name=model_name,
+            input=user_input,
+            sessionId=sessionId,
+            userId=userId,
+            system_prompt=system_prompt
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            'sessionId': sessionId,
+            'answer': f'服务错误: {str(e)}',
+            'done': True,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/health', methods=['GET'])
