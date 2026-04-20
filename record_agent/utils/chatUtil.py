@@ -2,16 +2,17 @@ import json
 from datetime import datetime
 from typing import List
 import os
-from pathlib import Path
 
-from langchain_community.embeddings import DashScopeEmbeddings
+import asyncio
+from langchain_community.chat_models import ChatTongyi
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from dashscope import Generation
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from record_agent.db_config import session_scope
 from record_agent.models import User, ChatHistory, ChatSession
+from record_agent.utils import ImageUtil
 from record_agent.utils.RAGUtil import get_rag
-
+from langchain.tools import tool
+from langgraph.prebuilt import create_react_agent, ToolNode
 default_memory_config = {
     "maxlen": 20
 }
@@ -33,6 +34,44 @@ redis_url = os.environ.get('REDIS_URL', "redis://localhost:6380/0")
 # 获取 Redis 客户端
 import redis
 redis_client = redis.from_url(redis_url)
+@tool
+def imageGenerate(input:str,imageFile:List[str]=[]):
+    """
+    用于图片的生成
+    input: input-用户需要生成的图片的文本描述，imageFile-用户如果有上传图片就把上传图片的地址粘贴上
+    output: 生成的图片下载链接
+    """
+    return ImageUtil.generateImage(input,imageFile)
+def imageGenerateErrorHandler(e:Exception):
+    print(e)
+    return str(e)
+
+
+async def get_tools_async():
+    client = MultiServerMCPClient(
+        {
+            "amap-maps":{
+                "command":"npx",
+                "args":[
+                    "-y",
+                    "@amap/amap-maps-mcp-server"
+                ],
+                "env":{
+                    "AMAP_MAPS_API_KEY": "a251175b85ab4823b4615ccdc731d58f"
+                },
+                "transport": "stdio"
+            }
+        }
+
+    )
+    tools = await client.get_tools()
+    print(tools)
+    return tools
+toolNode=ToolNode(
+        tools=[imageGenerate].append(asyncio.run(get_tools_async)),
+        handle_tool_errors=imageGenerateErrorHandler,
+)
+
 
 
 def _get_redis_history(session_id: int, userId: int) -> List[tuple]:
@@ -234,10 +273,10 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
     ])
 
     docs = get_rag(input, "pet")
-
-    # 构建 prompt
-    prompt_text = f"请根据历史记录{chat_history},历史摘要{chat_summary}和搜寻到的资料{docs}回答用户提问"
-    print(prompt_text)
+    model = ChatTongyi(model=model_name)
+    prompt = PromptTemplate.from_template(
+        "请根据历史记录{chat_history},历史摘要{chat_summary}和搜寻到的资料{docs}回答用户提问")
+    print(prompt)
 
     # 保存用户问题到数据库
     saveHistorys = []
@@ -253,38 +292,26 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 
     # 使用官方 dashscope SDK 调用
     try:
-        # 构建消息列表
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # 添加历史对话
-        for role, content in chat_history:
-            if role in ["user", "assistant"]:
-                messages.append({"role": role, "content": str(content)})
-
-        # 添加用户问题
-        messages.append({"role": "user", "content": input})
-
-        response = Generation.call(
-            api_key=os.getenv("DASHSCOPE_API_KEY"),
-            model=model_name,
-            messages=messages,
-            result_format="message",
-            enable_thinking=True,
+        chat = prompt|model
+        agent = create_react_agent(
+            model=model,
+            tools=toolNode,
+            prompt="你是一个智能记账助手"
         )
-
-        if response.status_code == 200:
-            full_answer = response.output.choices[0].message.content
+        response = chat.invoke({"chat_history": chat_history,"chat_summary": chat_summary,"docs": docs})
+        print(response)
+        if response!=None:
+            full_answer = response.content
 
             # 获取 token 使用量
-            total_input_tokens = response.usage.input_tokens
-            total_output_tokens = response.usage.output_tokens
+            total_input_tokens = response.response_metadata["token_usage"]["input_tokens"]
+            total_output_tokens = response.response_metadata["token_usage"]["output_tokens"]
         else:
-            print(f"API错误: {response.status_code}, {response.code}, {response.message}")
+            print(f"API错误: ")
             return {
                 "sessionId": sessionId,
                 "answer": f"API错误: {response.message}",
                 "done": True,
-                "error": response.message
             }
 
     except Exception as e:
@@ -332,18 +359,13 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
         print("[调试] 开始执行摘要处理")
         try:
             # 构建摘要消息
-            summary_messages = [{"role": "system", "content": "根据历史记录和已有的摘要提炼一份摘要，语言简洁，只保留和用户有关的关键信息，不要自己加信息"}]
-            summary_messages.extend([{"role": m["role"], "content": m["content"]} for m in messages if m["role"] in ["user", "assistant"]])
+            sum_model = ChatTongyi(model=model_name)
+            sum_prompt = PromptTemplate.from_template(f"根据历史记录{chat_history}和已有的摘要{chat_summary}提炼一份摘要，语言简洁，只保留和用户有关的关键信息，不要自己加信息")
+            sum_chat = sum_prompt|sum_model
+            sum_response = sum_chat.invoke({"chat_history":chat_history,"chat_summary":chat_summary})
 
-            sum_response = Generation.call(
-                api_key=os.getenv("DASHSCOPE_API_KEY"),
-                model=sum_model_name,
-                messages=summary_messages,
-                result_format="message",
-            )
-
-            if sum_response.status_code == 200:
-                summary_content = sum_response.output.choices[0].message.content
+            if sum_response!=None and sum_response.content != "" :
+                summary_content = sum_response.content
                 with session_scope() as session:
                     sum_chat_history = ChatHistory(
                         create_time=datetime.now(),
