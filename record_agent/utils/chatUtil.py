@@ -19,7 +19,7 @@ default_memory_config = {
 default_model = "qwen3-max"
 sum_model_name = "qwen3-max"
 default_system_prompt = "你是ztkk,一个智能手账助手，语气尽量温和专业。只需要回答最新的问题,不用每次都介绍自己，需要的时候才介绍"
-
+default_retry_count  =3
 role_dict = {
     0: "user",
     1: "assistant",
@@ -65,12 +65,9 @@ async def get_tools_async():
 
     )
     tools = await client.get_tools()
-    print(tools)
     return tools
-toolNode=ToolNode(
-        tools=[imageGenerate].append(asyncio.run(get_tools_async)),
-        handle_tool_errors=imageGenerateErrorHandler,
-)
+tools=[imageGenerate]
+tools.append(asyncio.run(get_tools_async()))
 
 
 
@@ -293,11 +290,6 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
     # 使用官方 dashscope SDK 调用
     try:
         chat = prompt|model
-        agent = create_react_agent(
-            model=model,
-            tools=toolNode,
-            prompt="你是一个智能记账助手"
-        )
         response = chat.invoke({"chat_history": chat_history,"chat_summary": chat_summary,"docs": docs})
         print(response)
         if response!=None:
@@ -357,29 +349,33 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 
     if sumFlag:
         print("[调试] 开始执行摘要处理")
-        try:
-            # 构建摘要消息
-            sum_model = ChatTongyi(model=model_name)
-            sum_prompt = PromptTemplate.from_template(f"根据历史记录{chat_history}和已有的摘要{chat_summary}提炼一份摘要，语言简洁，只保留和用户有关的关键信息，不要自己加信息")
-            sum_chat = sum_prompt|sum_model
-            sum_response = sum_chat.invoke({"chat_history":chat_history,"chat_summary":chat_summary})
-
-            if sum_response!=None and sum_response.content != "" :
-                summary_content = sum_response.content
-                with session_scope() as session:
-                    sum_chat_history = ChatHistory(
-                        create_time=datetime.now(),
-                        message_type="summary",
-                        meta_data=json.dumps(sum_dict, ensure_ascii=False),
-                        content=summary_content,
-                        user_id=userId,
-                        session_id=sessionId,
-                        role=1
-                    )
-                    session.add(sum_chat_history)
-                    print(sum_chat_history)
-        except Exception as e:
-            print(f"摘要处理失败: {e}")
+        sum_success=False
+        for i in range(default_retry_count):
+            if(sum_success):
+                break
+            try:
+                # 构建摘要消息
+                sum_model = ChatTongyi(model=model_name)
+                sum_prompt = PromptTemplate.from_template(f"根据历史记录{chat_history}和已有的摘要{chat_summary}提炼一份摘要，语言简洁，只保留和用户有关的关键信息，不要自己加信息")
+                sum_chat = sum_prompt|sum_model
+                sum_response = sum_chat.invoke({"chat_history":chat_history,"chat_summary":chat_summary})
+                sum_success=True
+            except Exception as e:
+                print(f"第{i}次摘要处理失败: {e}")
+        if sum_success == True and sum_response != None and sum_response.content != "":
+            summary_content = sum_response.content
+            with session_scope() as session:
+                sum_chat_history = ChatHistory(
+                    create_time=datetime.now(),
+                    message_type="summary",
+                    meta_data=json.dumps(sum_dict, ensure_ascii=False),
+                    content=summary_content,
+                    user_id=userId,
+                    session_id=sessionId,
+                    role=1
+                )
+                session.add(sum_chat_history)
+                print(sum_chat_history)
     else:
         print("[调试] 跳过摘要处理，sumFlag 不满足条件")
 
@@ -396,16 +392,17 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 if __name__ == "__main__":
     # save_rag("../test","pet")
 
-    # 第一次对话
-    print("=== 第一次对话 ===")
-    print("问题：你是谁？")
-    result = chat(None, "你是谁？", 1, 1)
-    print(f"回答：{result['answer']}")
-    print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
-
-    # 第二次对话
-    print("=== 第二次对话 ===")
-    print("问题：我的边牧叫wish")
-    result = chat(None, "我的边牧叫wish", 1, 1)
-    print(f"回答：{result['answer']}")
-    print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
+    # # 第一次对话
+    # print("=== 第一次对话 ===")
+    # print("问题：你是谁？")
+    # result = chat(None, "你是谁？", 1, 1)
+    # print(f"回答：{result['answer']}")
+    # print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
+    #
+    # # 第二次对话
+    # print("=== 第二次对话 ===")
+    # print("问题：我的边牧叫wish")
+    # result = chat(None, "我的边牧叫wish", 1, 1)
+    # print(f"回答：{result['answer']}")
+    # print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
+    print(tools)
