@@ -12,14 +12,16 @@ from record_agent.models import User, ChatHistory, ChatSession
 from record_agent.utils import ImageUtil
 from record_agent.utils.RAGUtil import get_rag
 from langchain.tools import tool
-from langgraph.prebuilt import create_react_agent, ToolNode
+
 default_memory_config = {
-    "maxlen": 20
+    "chat_max_len": 20,
+    "tool_max_len": 3
 }
 default_model = "qwen3-max"
 sum_model_name = "qwen3-max"
 default_system_prompt = "你是ztkk,一个智能手账助手，语气尽量温和专业。只需要回答最新的问题,不用每次都介绍自己，需要的时候才介绍"
 default_retry_count  =3
+default_tool_retry = 3
 role_dict = {
     0: "user",
     1: "assistant",
@@ -66,8 +68,13 @@ async def get_tools_async():
     )
     tools = await client.get_tools()
     return tools
+tool_dict = {"imageGenerate": imageGenerate}
 tools=[imageGenerate]
-tools.append(asyncio.run(get_tools_async()))
+mcp_tools = asyncio.run(get_tools_async())
+if mcp_tools:
+    for tool in mcp_tools:
+        tool_dict[tool.name] = tool
+        tools.append(tool)
 
 
 
@@ -78,7 +85,7 @@ def _get_redis_history(session_id: int, userId: int) -> List[tuple]:
 
     返回: List[(role, content)] 格式的历史记录
     """
-    key = f"chat_history:user_{userId}:{session_id}"
+    key = f"chat_history:user_{userId}:1{session_id}"
 
     try:
         # 检查 Redis 中是否有历史记录
@@ -107,7 +114,7 @@ def _load_and_sync_to_redis(session_id: int, userId: int, key: str) -> List[tupl
             ChatHistory.user_id == userId,
             ChatHistory.session_id == session_id,
             ChatHistory.message_type == "text"
-        ).order_by(ChatHistory.create_time.desc()).limit(default_memory_config['maxlen']).all()
+        ).order_by(ChatHistory.create_time.desc()).limit(default_memory_config['chat_max_len']).all()
 
         # 反转顺序（从旧到新）
         chatHistories = list(reversed(chatHistories))
@@ -134,7 +141,7 @@ def _save_to_redis(session_id: int, userId: int, user_message: str, assistant_me
     如果超过 maxlen，从队头移除最老的记录
     """
     key = f"chat_history:user_{userId}:{session_id}"
-    maxlen = default_memory_config['maxlen']
+    maxlen = default_memory_config['chat_max_len']
 
     # 添加用户消息和助手消息到队尾
     user_msg_json = json.dumps({"role": "user", "content": user_message}, ensure_ascii=False)
@@ -154,14 +161,13 @@ def _save_to_redis(session_id: int, userId: int, user_message: str, assistant_me
 
 
 
-
 def get_history(userId: int, sessionId: int)->dict:
     with session_scope() as session:
         chatHistorys = session.query(ChatHistory).filter(
             ChatHistory.user_id == userId,
             ChatHistory.session_id == sessionId,
             ChatHistory.message_type == "text"
-        ).order_by(ChatHistory.create_time).limit(default_memory_config['maxlen']).all()
+        ).order_by(ChatHistory.create_time).limit(default_memory_config['chat_max_len']).all()
         if None == chatHistorys or len(chatHistorys) == 0:
             return []
         history = []
@@ -180,7 +186,7 @@ def get_history(userId: int, sessionId: int)->dict:
                 if chatHistory.id > lastIndex:
                     count += 1
                 history.append((role_dict[chatHistory.role], chatHistory.content))
-            if count >= default_memory_config['maxlen']:
+            if count >= default_memory_config['chat_max_len']:
                 sumFlag = True
             else:
                 sumFlag = False
@@ -227,6 +233,59 @@ def save_history(userId: int, sessionId: int, chatHistorys: List[ChatHistory]):
         chatSession.update_time = datetime.now()
         session.commit()
         return sessionId
+def use_tool(response,key:str)->bool:
+    """
+    :param response:tool_name-工具名称
+    :return: 模型回答
+    """
+    res = []
+    if(response!=None and hasattr(response, 'tool_calls') and response.additional_kwargs.get("tool_calls")!=None and len(response.additional_kwargs["tool_calls"])>0):
+            tool_calls = response.additional_kwargs["tool_calls"]
+            for tool_call in tool_calls:
+                tool_name = tool_call["function"]["name"]
+                try:
+                    select_tool=tool_dict.get(tool_name)
+                    if(select_tool!=None):
+                        # 1. 正确解析参数
+                        tool_args = tool_call.get('args', {})
+
+                        # 如果没有args，尝试从function字段解析
+                        if not tool_args and 'function' in tool_call:
+                            args_str = tool_call['function'].get('arguments', '{}')
+                            try:
+                                tool_args = json.loads(args_str)
+                            except json.JSONDecodeError:
+                                tool_args = {}
+                        content = select_tool.invoke(tool_args)
+                        res.append({
+                            "tool_name": tool_name,
+                            "success": True,
+                            "content": content
+                        })
+                    else:
+                        res.append({
+                            "tool_name": tool_name,
+                            "success": False,
+                            "content": "调用失败，该工具不存在"
+                        })
+                        print("调用失败，该工具不存在")
+                except Exception as e:
+                    print(e)
+                    res.append({
+                        "tool_name": tool_name,
+                        "success": False,
+                        "content": f"调用失败，报错：{e}"
+                    })
+    else:
+        return False
+    #2.保存调用工具结果
+
+    redis_client.lpush(key, json.dumps(res))
+    key_len  = redis_client.llen(key)
+    if(key_len>default_memory_config["tool_max_len"]):
+        redis_client.rpop(key,key_len-default_memory_config["tool_max_len"])
+    return True
+
 
 
 def chat(model_name: str, input: str, sessionId: int = None, userId: int = None, system_prompt: str = None) -> dict:
@@ -250,7 +309,8 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 
     # 获取 Redis 中的对话历史
     redis_history_list = _get_redis_history(sessionId, userId)
-
+    tool_key = f"tool_history:user_{userId}:session_{sessionId}"
+    tool_history = redis_client.lrange(tool_key, 0, default_memory_config["tool_max_len"])
     # 获取摘要（从数据库），保持原有摘要逻辑不变
     history_dict = get_history(userId, sessionId)
     chat_summary = history_dict["summary"]
@@ -271,13 +331,14 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
 
     docs = get_rag(input, "pet")
     model = ChatTongyi(model=model_name)
-    prompt = PromptTemplate.from_template(
-        "请根据历史记录{chat_history},历史摘要{chat_summary}和搜寻到的资料{docs}回答用户提问")
-    print(prompt)
+    model = model.bind_tools(tools=tools)
+    prompt = PromptTemplate.from_template("请根据历史记录{chat_history},前几轮对话的工具调用结果{tool_history}，如果调用失败停止调用该工具,历史摘要{chat_summary}和搜寻到的资料{docs}回答用户提问")
+    # print(prompt)
+
 
     # 保存用户问题到数据库
     saveHistorys = []
-    if type(input) == str:
+    if type(input) == str and input!="":
         saveHistorys.append(ChatHistory(
             user_id=userId,
             session_id=sessionId,
@@ -290,11 +351,12 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
     # 使用官方 dashscope SDK 调用
     try:
         chat = prompt|model
-        response = chat.invoke({"chat_history": chat_history,"chat_summary": chat_summary,"docs": docs})
+        response = chat.invoke({"chat_history": chat_history,"chat_summary": chat_summary,"docs": docs,"tool_history":tool_history})
         print(response)
+        print(type(response.additional_kwargs))
+        tool_flag = use_tool(response,tool_key)
         if response!=None:
             full_answer = response.content
-
             # 获取 token 使用量
             total_input_tokens = response.response_metadata["token_usage"]["input_tokens"]
             total_output_tokens = response.response_metadata["token_usage"]["output_tokens"]
@@ -305,7 +367,6 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
                 "answer": f"API错误: {response.message}",
                 "done": True,
             }
-
     except Exception as e:
         print(f"获取响应失败: {e}")
         import traceback
@@ -316,7 +377,7 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
             "done": True,
             "error": str(e)
         }
-
+    meta = [response.additional_kwargs,response.response_metadata]
     # 保存完整的助手回答
     saveHistorys.append(ChatHistory(
         user_id=userId,
@@ -326,6 +387,7 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
         model=model_name,
         tokens_used=total_output_tokens,
         create_time=datetime.now(),
+        meta_data=json.dumps(meta)
     ))
 
     # 更新用户问题的 token 使用量
@@ -384,25 +446,39 @@ def chat(model_name: str, input: str, sessionId: int = None, userId: int = None,
         "answer": full_answer,
         "inputTokens": total_input_tokens,
         "outputTokens": total_output_tokens,
-        "done": True
+        "done": True,
+        "finish_reason":response.response_metadata["finish_reason"]
     }
+
+def agent_loop(model_name: str, input: str, sessionId: int = None, userId: int = None, system_prompt: str = None):
+    times = 0
+    while True:
+        if(times>=5):
+            break
+        res = chat(model_name, input, sessionId, userId, system_prompt)
+        print(res)
+        if res["finish_reason"]!="tool_calls":
+            break
+        times+=1
+        input="根据上一轮调用的结果继续回答问题"
+    return f"此次调用一共进行了{times}\n最终调用结果：{res}"
 
 
 
 if __name__ == "__main__":
     # save_rag("../test","pet")
 
-    # # 第一次对话
-    # print("=== 第一次对话 ===")
-    # print("问题：你是谁？")
-    # result = chat(None, "你是谁？", 1, 1)
-    # print(f"回答：{result['answer']}")
-    # print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
-    #
+    # 第一次对话
+    print("=== 第一次对话 ===")
+    print("问题：给我家小狗设计一个动漫头像，二次元风格，尺寸一比一")
+    result = agent_loop(None, "给我家小猫设计一个动漫头像", 1, 1)
+    print(f"回答：{result}")
+    print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
+
     # # 第二次对话
     # print("=== 第二次对话 ===")
     # print("问题：我的边牧叫wish")
     # result = chat(None, "我的边牧叫wish", 1, 1)
     # print(f"回答：{result['answer']}")
     # print(f"输入Token: {result.get('inputTokens', 0)}, 输出Token: {result.get('outputTokens', 0)}\n")
-    print(tools)
+    # print(tools)
